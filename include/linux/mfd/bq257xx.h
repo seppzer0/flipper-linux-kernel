@@ -504,16 +504,13 @@
 #define BQ25792_REG48_PN_MASK			GENMASK(5, 3)
 #define BQ25792_REG48_DEV_REV_MASK		GENMASK(2, 0)
 
-struct bq257xx_device {
-	struct i2c_client *client;
-	struct regmap *regmap;
-};
-
 enum bq257xx_type {
 	BQ25703A,
 	BQ25792,
 };
 
-struct bq257xx_plat {
+struct bq257xx_device {
+	struct i2c_client *client;
+	struct regmap *regmap;
 	enum bq257xx_type type;
 };
