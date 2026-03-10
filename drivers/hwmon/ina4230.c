@@ -8,11 +8,11 @@
 
 #include <linux/bitfield.h>
 #include <linux/byteorder/generic.h>
-#include <linux/debugfs.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/i2c.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
@@ -56,7 +56,7 @@
 #define INA4230_CONFIG1				0x20
 #define INA4230_CONFIG2				0x21
 #define INA4230_FLAGS				0x22
-#define INA4230_MANUFACTURER_ID 		0x7E
+#define INA4230_MANUFACTURER_ID			0x7E
 
 #define INA4230_CALIBRATION_MASK		GENMASK(14, 0)
 
@@ -73,7 +73,7 @@
 /* Power over limit */
 #define INA4230_ALERT_MASK_POL			0x5
 
-#define INA4230_CONFIG1_ACTIVE_CHANNEL_MASK 	GENMASK(15, 12)
+#define INA4230_CONFIG1_ACTIVE_CHANNEL_MASK	GENMASK(15, 12)
 #define INA4230_CONFIG1_AVG_MASK		GENMASK(11, 9)
 #define INA4230_CONFIG1_VBUSCT_MASK		GENMASK(8, 6)
 #define INA4230_CONFIG1_VSHCT_MASK		GENMASK(5, 3)
@@ -110,11 +110,11 @@
 
 #define INA4230_RSHUNT_DEFAULT			10000
 #define INA4230_CONFIG_DEFAULT \
-		FIELD_PREP(INA4230_CONFIG1_ACTIVE_CHANNEL_MASK, 0xF) | \
+		(FIELD_PREP(INA4230_CONFIG1_ACTIVE_CHANNEL_MASK, 0xF) | \
 		FIELD_PREP(INA4230_CONFIG1_AVG_MASK, 0x1) | \
 		FIELD_PREP(INA4230_CONFIG1_VBUSCT_MASK, 0x4) | \
 		FIELD_PREP(INA4230_CONFIG1_VSHCT_MASK, 0x4) | \
-		FIELD_PREP(INA4230_CONFIG1_MODE_MASK, 0x7)
+		FIELD_PREP(INA4230_CONFIG1_MODE_MASK, 0x7))
 #define INA4230_CONFIG_CHx_EN(x) \
 		FIELD_PREP(INA4230_CONFIG1_ACTIVE_CHANNEL_MASK, BIT((x)))
 
@@ -184,7 +184,8 @@ enum ina4230_channels {
  * @shunt_resistor: shunt resistor value of channel input source
  * @shunt_gain: gain of shunt voltage for current calculation
  * @max_expected_current: maximum expected current in micro-Ampere for ADC
- * 			  calibration
+ *			  calibration
+ * @current_lsb_uA: current LSB in micro-Amperes
  * @disconnected: connection status of channel input source
  */
 struct ina4230_input {
@@ -202,6 +203,10 @@ struct ina4230_input {
  * @regmap: Register map of the device
  * @fields: Register fields of the device
  * @inputs: Array of channel input source specific structures
+ * @reg_config1: cached value of CONFIG1 register
+ * @reg_config2: cached value of CONFIG2 register
+ * @single_shot: flag indicating single-shot measurement mode
+ * @alert_active_high: flag indicating alert polarity is active high
  */
 struct ina4230_data {
 	struct device *pm_dev;
@@ -278,6 +283,7 @@ static int ina4230_set_calibration(struct ina4230_data *ina, int channel)
 	u8 reg = ina4230_calibration_reg[channel];
 	int shunt_range_uV, ret;
 	u32 calibration;
+	u64 n, d;
 
 	shunt_range_uV = mult_frac(input->max_expected_current,
 				   input->shunt_resistor,
@@ -292,10 +298,19 @@ static int ina4230_set_calibration(struct ina4230_data *ina, int channel)
 		return ret;
 
 	input->current_lsb_uA = DIV_ROUND_UP(input->max_expected_current, 32768);
-	calibration = DIV_ROUND_CLOSEST(5120000000ULL,
-				       (u64)input->current_lsb_uA *
-				       input->shunt_resistor *
-				       input->shunt_gain);
+	n = 5120000000ULL;
+	d = (u64)input->current_lsb_uA * input->shunt_resistor * input->shunt_gain;
+	/* Ensure rounding to the closest integer */
+	n += d / 2;
+	n = div64_u64(n, d);
+	if (n > INA4230_CALIBRATION_MASK) {
+		dev_err(ina->pm_dev,
+			"Shunt %duOhm too low for expected current %duA, cannot calibrate channel %d\n",
+			input->shunt_resistor, input->max_expected_current, channel + 1);
+		return -ERANGE;
+	}
+
+	calibration = n & INA4230_CALIBRATION_MASK;
 
 	return regmap_write(ina->regmap, reg, calibration);
 }
@@ -364,8 +379,10 @@ static int ina4230_read_in(struct device *dev, u32 attr, int channel, long *val)
 
 		/* Write CONFIG register to trigger a single-shot measurement */
 		if (ina->single_shot) {
-			regmap_write(ina->regmap, INA4230_CONFIG1,
+			ret = regmap_write(ina->regmap, INA4230_CONFIG1,
 				     ina->reg_config1);
+			if (ret)
+				return ret;
 
 			ret = ina4230_wait_for_data(ina);
 			if (ret)
@@ -381,9 +398,14 @@ static int ina4230_read_in(struct device *dev, u32 attr, int channel, long *val)
 		 *				depending on gain setting
 		 * Scale of bus voltage (mV): LSB is 1.6mV
 		 */
-		*val = (int16_t)regval *
-			(long)(is_shunt ? 2500 / ina->inputs[channel].shunt_gain
-					: 1600000) / 1000000;
+		if (is_shunt)
+			*val = mult_frac((long)(int16_t)regval,
+					 2500 / ina->inputs[channel].shunt_gain,
+					 1000000);
+		else
+			*val = mult_frac((long)(int16_t)regval,
+					 1600,
+					 1000);
 		return 0;
 	case hwmon_in_enable:
 		*val = ina4230_is_enabled(ina, channel);
@@ -428,7 +450,7 @@ static int ina4230_read_energy(struct device *dev, u32 attr, int channel, long *
 		if (!ina4230_is_enabled(ina, channel))
 			return -ENODATA;
 
-		ret = regmap_raw_read(ina->regmap, reg, &regval, sizeof(regval));
+		ret = regmap_noinc_read(ina->regmap, reg, &regval, sizeof(regval));
 		if (ret)
 			return ret;
 
@@ -452,12 +474,12 @@ static int ina4230_read_curr(struct device *dev, u32 attr,
 		if (!ina4230_is_enabled(ina, channel))
 			return -ENODATA;
 
-		ina4230_set_calibration(ina, channel);
-
 		/* Write CONFIG1 register to trigger a single-shot measurement */
 		if (ina->single_shot) {
-			regmap_write(ina->regmap, INA4230_CONFIG1,
-				     ina->reg_config1);
+			ret = regmap_write(ina->regmap, INA4230_CONFIG1,
+				       ina->reg_config1);
+			if (ret)
+				return ret;
 
 			ret = ina4230_wait_for_data(ina);
 			if (ret)
@@ -502,6 +524,54 @@ static int ina4230_write_chip(struct device *dev, u32 attr, long val)
 	}
 }
 
+static int ina4230_write_enable(struct device *dev, int channel, bool enable)
+{
+	struct ina4230_data *ina = dev_get_drvdata(dev);
+	u16 config, mask = INA4230_CONFIG_CHx_EN(channel);
+	u16 config_old = ina->reg_config1 & mask;
+	u32 tmp;
+	int ret;
+
+	config = enable ? mask : 0;
+
+	/* Bypass if enable status is not being changed */
+	if (config_old == config)
+		return 0;
+
+	/* For enabling routine, increase refcount and resume() at first */
+	if (enable) {
+		ret = pm_runtime_resume_and_get(ina->pm_dev);
+		if (ret < 0) {
+			dev_err(dev, "Failed to get PM runtime\n");
+			return ret;
+		}
+	}
+
+	/* Enable or disable the channel */
+	tmp = (ina->reg_config1 & ~mask) | (config & mask);
+	ret = regmap_write(ina->regmap, INA4230_CONFIG1, tmp);
+	if (ret)
+		goto fail;
+
+	/* Cache the latest config register value */
+	ina->reg_config1 = tmp;
+
+	/* For disabling routine, decrease refcount or suspend() at last */
+	if (!enable)
+		pm_runtime_put_sync(ina->pm_dev);
+
+	return 0;
+
+fail:
+	if (enable) {
+		dev_err(dev, "Failed to enable channel %d: error %d\n",
+			channel, ret);
+		pm_runtime_put_sync(ina->pm_dev);
+	}
+
+	return ret;
+}
+
 static int ina4230_read(struct device *dev, enum hwmon_sensor_types type,
 			u32 attr, int channel, long *val)
 {
@@ -539,6 +609,10 @@ static int ina4230_write(struct device *dev, enum hwmon_sensor_types type,
 	switch (type) {
 	case hwmon_chip:
 		ret = ina4230_write_chip(dev, attr, val);
+		break;
+	case hwmon_in:
+		/* 0-align channel ID */
+		ret = ina4230_write_enable(dev, channel - 1, val);
 		break;
 	default:
 		ret = -EOPNOTSUPP;
@@ -750,13 +824,12 @@ static int ina4230_probe_child_from_dt(struct device *dev,
 	int ret;
 
 	ret = of_property_read_u32(child, "reg", &val);
-	if (ret) {
-		dev_err(dev, "missing reg property of %pOFn\n", child);
-		return ret;
-	} else if (val > INA4230_CHANNEL4) {
-		dev_err(dev, "invalid reg %d of %pOFn\n", val, child);
-		return -EINVAL;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+			"missing reg property of %pOFn\n", child);
+	else if (val > INA4230_CHANNEL4)
+		return dev_err_probe(dev, -EINVAL,
+			"invalid reg %d of %pOFn\n", val, child);
 
 	input = &ina->inputs[val];
 
@@ -771,21 +844,21 @@ static int ina4230_probe_child_from_dt(struct device *dev,
 
 	/* Overwrite default shunt resistor value optionally */
 	if (!of_property_read_u32(child, "shunt-resistor-micro-ohms", &val)) {
-		if (val < 1 || val > INT_MAX) {
-			dev_err(dev, "invalid shunt resistor value %u of %pOFn\n",
+		if (val < 1 || val > INT_MAX)
+			return dev_err_probe(dev, -EINVAL,
+				"invalid shunt resistor value %u of %pOFn\n",
 				val, child);
-			return -EINVAL;
-		}
+
 		input->shunt_resistor = val;
 	}
 
 	/* Save the expected maxcurrent */
 	if (!of_property_read_u32(child, "ti,maximum-expected-current-microamp", &val)) {
-		if (val < 32768 || val > INT_MAX) {
-			dev_err(dev, "invalid max current value %u of %pOFn\n",
+		if (val < 32768 || val > INT_MAX)
+			return dev_err_probe(dev, -EINVAL,
+				"invalid max current value %u of %pOFn\n",
 				val, child);
-			return -EINVAL;
-		}
+
 		input->max_expected_current = val;
 	}
 
@@ -825,20 +898,14 @@ static int ina4230_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	ina->regmap = devm_regmap_init_i2c(client, &ina4230_regmap_config);
-	if (IS_ERR(ina->regmap)) {
-		dev_err(dev, "Unable to allocate register map\n");
+	if (IS_ERR(ina->regmap))
 		return PTR_ERR(ina->regmap);
-	}
 
-	for (i = 0; i < F_MAX_FIELDS; i++) {
-		ina->fields[i] = devm_regmap_field_alloc(dev,
-							 ina->regmap,
-							 ina4230_reg_fields[i]);
-		if (IS_ERR(ina->fields[i])) {
-			dev_err(dev, "Unable to allocate regmap fields\n");
-			return PTR_ERR(ina->fields[i]);
-		}
-	}
+	ret = devm_regmap_field_bulk_alloc(dev, ina->regmap, ina->fields,
+					   ina4230_reg_fields,
+					   ARRAY_SIZE(ina4230_reg_fields));
+	if (ret)
+		return ret;
 
 	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
 		ina->inputs[i].shunt_resistor = INA4230_RSHUNT_DEFAULT;
@@ -847,10 +914,9 @@ static int ina4230_probe(struct i2c_client *client)
 	}
 
 	ret = ina4230_probe_from_dt(dev, ina);
-	if (ret) {
-		dev_err(dev, "Unable to probe from device tree\n");
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+			"Unable to probe from device tree\n");
 
 	/* The driver will be reset, so use reset value */
 	ina->reg_config1 = INA4230_CONFIG_DEFAULT;
@@ -866,14 +932,17 @@ static int ina4230_probe(struct i2c_client *client)
 			ina->reg_config1 &= ~INA4230_CONFIG_CHx_EN(i);
 	}
 
-	/* Set calibration values */
-	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
-		if (!ina->inputs[i].disconnected)
-			ina4230_set_calibration(ina, i);
-	}
-
 	ina->pm_dev = dev;
 	dev_set_drvdata(dev, ina);
+
+	/* Set calibration values */
+	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
+		if (!ina->inputs[i].disconnected) {
+			ret = ina4230_set_calibration(ina, i);
+			if (ret)
+				return ret;
+		}
+	}
 
 	/* Enable PM runtime -- status is suspended by default */
 	pm_runtime_enable(ina->pm_dev);
@@ -882,6 +951,7 @@ static int ina4230_probe(struct i2c_client *client)
 	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
 		if (ina->inputs[i].disconnected)
 			continue;
+
 		/* Match the refcount with number of enabled channels */
 		ret = pm_runtime_get_sync(ina->pm_dev);
 		if (ret < 0)
@@ -892,8 +962,8 @@ static int ina4230_probe(struct i2c_client *client)
 							 &ina4230_chip_info,
 							 ina4230_groups);
 	if (IS_ERR(hwmon_dev)) {
-		dev_err(dev, "Unable to register hwmon device\n");
-		ret = PTR_ERR(hwmon_dev);
+		ret = dev_err_probe(dev, PTR_ERR(hwmon_dev),
+			"Unable to register hwmon device\n");
 		goto fail;
 	}
 
@@ -902,9 +972,11 @@ static int ina4230_probe(struct i2c_client *client)
 fail:
 	pm_runtime_disable(ina->pm_dev);
 	pm_runtime_set_suspended(ina->pm_dev);
-	/* pm_runtime_put_noidle() will decrease the PM refcount until 0 */
-	for (i = 0; i < INA4230_NUM_CHANNELS; i++)
-		pm_runtime_put_noidle(ina->pm_dev);
+	/* pm_runtime_put_noidle() for connected channels to balance get_sync */
+	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
+		if (!ina->inputs[i].disconnected)
+			pm_runtime_put_noidle(ina->pm_dev);
+	}
 
 	return ret;
 }
@@ -917,9 +989,11 @@ static void ina4230_remove(struct i2c_client *client)
 	pm_runtime_disable(ina->pm_dev);
 	pm_runtime_set_suspended(ina->pm_dev);
 
-	/* pm_runtime_put_noidle() will decrease the PM refcount until 0 */
-	for (i = 0; i < INA4230_NUM_CHANNELS; i++)
-		pm_runtime_put_noidle(ina->pm_dev);
+	/* pm_runtime_put_noidle() for connected channels to balance get_sync */
+	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
+		if (!ina->inputs[i].disconnected)
+			pm_runtime_put_noidle(ina->pm_dev);
+	}
 }
 
 static int ina4230_suspend(struct device *dev)
@@ -989,4 +1063,4 @@ module_i2c_driver(ina4230_i2c_driver);
 
 MODULE_AUTHOR("Alexey Charkov <alchark@flipper.net>");
 MODULE_DESCRIPTION("Texas Instruments INA4230 HWMon Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
