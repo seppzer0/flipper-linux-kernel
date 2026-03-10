@@ -777,9 +777,10 @@ static int bq25792_hw_init(struct bq257xx_chg *pdata)
 
 	/*
 	 * Enable battery discharge current sensing, 5A discharge current
-	 * limit, input current regulation
+	 * limit, input current regulation and ship FET functions
 	 */
 	regmap_write(regmap, BQ25792_REG14_CHARGER_CONTROL_5,
+		     BQ25792_REG14_SFET_PRESENT |
 		     BQ25792_REG14_EN_IBAT |
 		     BQ25792_IBAT_5A |
 		     BQ25792_REG14_EN_IINDPM);
@@ -1173,7 +1174,6 @@ static int bq257xx_charger_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct bq257xx_device *bq = dev_get_drvdata(pdev->dev.parent);
-	struct bq257xx_plat *plat = dev_get_platdata(dev);
 	struct bq257xx_chg *pdata;
 	struct power_supply_config psy_cfg = { };
 	int ret;
@@ -1186,7 +1186,7 @@ static int bq257xx_charger_probe(struct platform_device *pdev)
 
 	pdata->bq = bq;
 
-	switch (plat->type) {
+	switch (bq->type) {
 	case BQ25703A:
 		pdata->chip = &bq25703_chip_info;
 		break;
