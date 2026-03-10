@@ -935,15 +935,6 @@ static int ina4230_probe(struct i2c_client *client)
 	ina->pm_dev = dev;
 	dev_set_drvdata(dev, ina);
 
-	/* Set calibration values */
-	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
-		if (!ina->inputs[i].disconnected) {
-			ret = ina4230_set_calibration(ina, i);
-			if (ret)
-				return ret;
-		}
-	}
-
 	/* Enable PM runtime -- status is suspended by default */
 	pm_runtime_enable(ina->pm_dev);
 
@@ -956,6 +947,15 @@ static int ina4230_probe(struct i2c_client *client)
 		ret = pm_runtime_get_sync(ina->pm_dev);
 		if (ret < 0)
 			goto fail;
+	}
+
+	/* Set calibration values after device resume/reset */
+	for (i = 0; i < INA4230_NUM_CHANNELS; i++) {
+		if (!ina->inputs[i].disconnected) {
+			ret = ina4230_set_calibration(ina, i);
+			if (ret)
+				goto fail;
+		}
 	}
 
 	hwmon_dev = devm_hwmon_device_register_with_info(dev, client->name, ina,
