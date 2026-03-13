@@ -630,7 +630,7 @@ static int rockchip_sai_hw_params(struct snd_pcm_substream *substream,
 
 	if (!sai->is_tdm)
 		regmap_update_bits(sai->regmap, reg, SAI_XCR_SBW_MASK,
-				   SAI_XCR_SBW(params_width(params)));
+				   SAI_XCR_SBW(params_physical_width(params)));
 
 	regmap_read(sai->regmap, reg, &val);
 
